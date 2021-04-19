@@ -5,7 +5,8 @@
             [clojure.tools.deps.alpha :as t]
             [clojure.tools.deps.alpha.gen.pom :as pom]
             [clojure.tools.logging :as logger]
-            [clojure.tools.namespace.find :as tnsf])
+            [clojure.tools.namespace.find :as tnsf]
+            [garamond.git :as git])
   (:import (java.io File InputStream PushbackReader)
            (java.nio.file CopyOption LinkOption OpenOption
                           StandardCopyOption StandardOpenOption
@@ -305,11 +306,13 @@
 (defn- read-edn-files
   "Given as options map, use tools.deps.alpha to read and merge the
   applicable `deps.edn` files."
-  [{:keys [repro] :or {repro true}}]
-  (let [{:keys [root-edn user-edn project-edn]} (t/find-edn-maps)]
+  [{:keys [repro project-edn-file deps] :or {repro true} :as opts}]
+  (let [{:keys [root-edn user-edn project-edn]} (if project-edn-file
+                                                  (t/find-edn-maps project-edn-file)
+                                                  (t/find-edn-maps))]
     (t/merge-edns (if repro
-                    [root-edn project-edn]
-                    [root-edn user-edn project-edn]))))
+                    [root-edn project-edn deps]
+                    [root-edn user-edn project-edn deps]))))
 
 (defn- calc-project-basis
   "Given the options map, use tools.deps.alpha to read and merge the
@@ -341,6 +344,9 @@
       (first)
       (second)))
 
+(defn to-maven-scheme [git-url]
+  (when git-url (str "scm:git:" git-url)))
+
 (defn- sync-gav
   "Given a pom file and options, return the group/artifact IDs and
   the version. These are taken from the options, if present, otherwise
@@ -352,11 +358,15 @@
   the pom file will be updated to reflect those in the options hash map.
 
   Throw an exception if we cannot read them from the pom file."
-  [pom-file {:keys [artifact-id group-id version]}]
+  [pom-file {:keys [artifact-id group-id version scm-url]}]
   (let [pom-text     (slurp pom-file)
         artifact-id' (first-by-tag pom-text :artifactId)
         group-id'    (first-by-tag pom-text :groupId)
         version'     (first-by-tag pom-text :version)
+        git-url      (when scm-url
+                       (to-maven-scheme (git/remote-url)))
+        sha          (when scm-url
+                       (git/current-sha))
         result       {:artifact-id (or artifact-id artifact-id')
                       :group-id    (or group-id    group-id')
                       :version     (or version     version')}]
@@ -381,6 +391,17 @@
               (and group-id    group-id'    (not= group-id group-id'))
               (str/replace-first (str "<groupId>" group-id' "</groupId>")
                                  (str "<groupId>" group-id  "</groupId>"))
+
+              ; TODO: use zxml / xml (or a resource file)
+              (and scm-url (not (str/includes? pom-text "<scm>")))
+              (str/replace-first "</name>"
+                                 (str "</name>
+  <scm>
+    <connection>" git-url "</connection>
+    <developerConnection>" git-url "</developerConnection>
+    <tag>" sha "</tag>
+    <url>" scm-url "</url>
+  </scm>"))
 
               (and version     version'     (not= version version'))
               (->
@@ -588,6 +609,7 @@
   (println "                        matches can be symbols or regex strings")
   (println "  :debug-clash true  -- print warnings about clashing jar items")
   (println "  (can be useful if you are not getting the files you expect in the JAR)")
+  (println "  :deps {kvs}   					-- Deps data to use as the last deps file to be merged")
   (println "  :exclude [regex]   -- exclude files via regex")
   (println "  :group-id sym      -- specify group ID to be used (reverse domain name preferred)")
   (println "  :help true         -- show this help (and exit)")
@@ -598,7 +620,9 @@
   (println "  :no-pom true       -- ignore pom.xml")
   (println "  :paths-only true   -- use only paths from the basis, not the classpath")
   (println "  :pom-file str      -- optional path to a different 'pom.xml' file")
+  (println "  :project-edn-file str -- set project edn file")
   (println "  :repro false       -- include user 'deps.edn' when computing the classpath")
+  (println "  :scm-url str     		-- add scm section with provided scm url in 'pom.xml'")
   (println "  :sync-pom true     -- synchronize 'pom.xml' dependencies, group, artifact, and version")
   (println "  :verbose true      -- explain what goes into the JAR file")
   (println "  :version str       -- specify the version (of the group/artifact)"))
@@ -665,15 +689,18 @@
                            :jar        jar
                            :jar-type   jar-type
                            :main-class main-class)
-         basis      (calc-project-basis options)
+         basis      (calc-project-basis (-> options
+                                            (dissoc :project-edn-file)))
          c-basis    (if-let [c-aliases (not-empty compile-aliases)]
-                      (calc-project-basis (assoc options :aliases c-aliases))
+                      (calc-project-basis (-> options
+                                              (assoc :aliases c-aliases)
+                                              (dissoc :project-edn-file)))
                       basis)
          ^File
          pom-file   (io/file (or pom-file "pom.xml"))
          _
          (when sync-pom
-           (pom-sync pom-file basis options))
+           (pom-sync pom-file (calc-project-basis options) options))
          _
          (when (and aot (= :thin jar-type))
            (logger/warn ":aot is not recommended for a 'thin' JAR!"))
